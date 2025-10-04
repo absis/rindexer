@@ -30,7 +30,8 @@ pub async fn setup_postgres(
 ) -> Result<PostgresClient, SetupPostgresError> {
     info!("Setting up postgres");
 
-    let client = PostgresClient::new().await?;
+    let use_rds_iam = manifest.storage.postgres_rds_iam_auth();
+    let client = PostgresClient::new_with_config(use_rds_iam).await?;
     let disable_event_tables = manifest.storage.postgres_disable_create_tables();
 
     if manifest.storage.postgres_drop_each_run() {

@@ -87,6 +87,9 @@ pub struct PostgresDetails {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_create_tables: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rds_iam_auth: Option<bool>,
 }
 
 fn default_csv_path() -> String {
@@ -170,6 +173,15 @@ impl Storage {
         }
 
         self.csv.as_ref().is_some_and(|details| details.disable_create_headers.unwrap_or_default())
+    }
+
+    pub fn postgres_rds_iam_auth(&self) -> bool {
+        let enabled = self.postgres_enabled();
+        if !enabled {
+            return false;
+        }
+
+        self.postgres.as_ref().is_some_and(|details| details.rds_iam_auth.unwrap_or_default())
     }
 
     pub async fn create_relationships_and_indexes(

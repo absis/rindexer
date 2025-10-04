@@ -618,7 +618,9 @@ pub async fn initialize_database(
     manifest: &Manifest,
 ) -> Result<Option<Arc<PostgresClient>>, StartIndexingError> {
     if manifest.storage.postgres_enabled() {
-        match PostgresClient::new().await {
+        let use_rds_iam = manifest.storage.postgres_rds_iam_auth();
+
+        match PostgresClient::new_with_config(use_rds_iam).await {
             Ok(postgres) => Ok(Some(Arc::new(postgres))),
             Err(e) => {
                 error!("Error connecting to Postgres: {:?}", e);
