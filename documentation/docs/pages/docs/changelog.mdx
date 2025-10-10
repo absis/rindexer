@@ -5,6 +5,11 @@
 
 ### Features
 -------------------------------------------------
+- feat: add AWS RDS IAM authentication support for PostgreSQL with automatic token refresh
+  - Zero-downtime token rotation (15-minute token TTL with 5-minute refresh)
+  - Two activation methods: YAML config (`rds_iam_auth: true`) or environment variable (`USE_RDS_IAM_AUTH=true`)
+  - Fully backward compatible - no breaking changes
+  - See [Storage Documentation](/docs/start-building/yaml-config/storage#aws-rds-iam-authentication) for setup guide
 - feat: check if the RPC chain id is matching the configured chain id in the yaml config on startup
 - feat: add support for `RINDEXER_LOG` environment variable to control the log level of rindexer
 

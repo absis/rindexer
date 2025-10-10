@@ -75,6 +75,50 @@ This will start all local indexing and if you have enabled the graphql endpoint,
 
 http://localhost:3001
 
+## AWS RDS IAM Authentication
+
+rindexer supports AWS RDS IAM authentication for PostgreSQL connections, providing enhanced security with short-lived tokens and automatic credential rotation.
+
+### Quick Start
+
+**Option 1: YAML Configuration**
+
+Add to your `rindexer.yaml`:
+
+```yaml
+storage:
+  postgres:
+    enabled: true
+    rds_iam_auth: true
+```
+
+**Option 2: Environment Variable**
+
+```bash
+# Enable RDS IAM authentication
+export USE_RDS_IAM_AUTH=true
+```
+
+Then set connection details:
+
+```bash
+export DATABASE_USER=your-db-user
+export DATABASE_HOST=your-db.region.rds.amazonaws.com
+export DATABASE_NAME=your-database
+export DATABASE_PORT=5432
+export AWS_REGION=us-east-1
+```
+
+### Features
+
+- ✅ Zero-downtime token rotation (15-minute token TTL)
+- ✅ Automatic token refresh every 5 minutes
+- ✅ No long-lived database passwords
+- ✅ AWS CloudTrail audit logging
+- ✅ Fully backward compatible (opt-in via YAML or environment variable)
+
+For complete setup instructions including IAM policies and database configuration, see the [Storage Documentation](https://rindexer.xyz/docs/start-building/yaml-config/storage#aws-rds-iam-authentication).
+
 ## Helm Chart
 
 We also provide a Helm chart for deploying `rindexer` in Kubernetes environments. The Helm chart simplifies the deployment process and allows for easy customization of the deployment parameters.

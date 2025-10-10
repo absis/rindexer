@@ -34,6 +34,160 @@ DATABASE_URL=postgresql://[user[:password]@][host][:port][/dbname]
 `sslmode=require` is supported as well just include it in the connection string. If you are using AWS RDS, you will need to include the RDS certificates in your connection configuration. You can find the necessary certificates in the [AWS RDS SSL documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html).
 :::
 
+### AWS RDS IAM Authentication
+
+:::info
+rindexer supports AWS RDS IAM authentication for enhanced security with automatic token rotation.
+:::
+
+If you're deploying to AWS and using RDS PostgreSQL, you can enable IAM authentication instead of using traditional passwords. This provides:
+
+- ✅ Short-lived authentication tokens (15-minute TTL)
+- ✅ Automatic token refresh every 5 minutes
+- ✅ No long-lived database passwords in environment variables
+- ✅ AWS CloudTrail audit logging for database access
+
+#### Option 1: Enable via YAML Configuration
+
+You can enable RDS IAM authentication directly in your `rindexer.yaml` file:
+
+```yaml [rindexer.yaml]
+name: rETHIndexer
+description: My first rindexer project
+repository: https://github.com/joshstevens19/rindexer
+project_type: no-code
+networks:
+- name: ethereum
+  chain_id: 1
+  rpc: https://mainnet.gateway.tenderly.co
+storage:
+  postgres:
+    enabled: true
+    rds_iam_auth: true
+```
+
+Then set the required environment variables:
+
+```bash
+# Database connection details
+DATABASE_USER=your-db-user
+DATABASE_HOST=your-db.region.rds.amazonaws.com
+DATABASE_NAME=your-database
+DATABASE_PORT=5432
+
+# AWS credentials (if not using IAM roles)
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
+```
+
+#### Option 2: Enable via Environment Variable
+
+Alternatively, you can enable it using an environment variable (useful for overriding YAML config or when not using a YAML file):
+
+```bash
+# Enable RDS IAM authentication
+USE_RDS_IAM_AUTH=true
+
+# Database connection details
+DATABASE_USER=your-db-user
+DATABASE_HOST=your-db.region.rds.amazonaws.com
+DATABASE_NAME=your-database
+DATABASE_PORT=5432
+
+# AWS credentials (if not using IAM roles)
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
+```
+
+:::info
+**Configuration Precedence:** If both the YAML `rds_iam_auth` and the environment variable `USE_RDS_IAM_AUTH` are set, the environment variable takes precedence. This allows for runtime overrides without modifying your YAML configuration.
+:::
+
+:::warning
+When using RDS IAM authentication, do not set `DATABASE_URL`. The connection will be configured automatically from the individual environment variables above.
+:::
+
+#### AWS Setup Requirements
+
+To use RDS IAM authentication, you need to configure both AWS IAM and your RDS instance:
+
+**1. Enable IAM Authentication on RDS:**
+- Go to your RDS instance in AWS Console
+- Modify the database and enable "IAM database authentication"
+- Apply the changes (requires a brief restart)
+
+**2. Create IAM Policy:**
+
+Create an IAM policy that allows `rds-db:connect`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": "arn:aws:rds-db:REGION:ACCOUNT_ID:dbuser:RESOURCE_ID/DATABASE_USER"
+    }
+  ]
+}
+```
+
+Replace:
+- `REGION`: Your AWS region (e.g., `us-east-1`)
+- `ACCOUNT_ID`: Your AWS account ID
+- `RESOURCE_ID`: Your RDS resource ID (found in RDS console)
+- `DATABASE_USER`: Your database username
+
+**3. Attach Policy to IAM Role:**
+- For EKS/ECS: Attach to your pod/task IAM role
+- For EC2: Attach to your EC2 instance role
+- For local development: Use AWS credentials with this policy
+
+**4. Create Database User:**
+
+Connect to your PostgreSQL database and create a user for IAM authentication:
+
+```sql
+CREATE USER your_db_user;
+GRANT rds_iam TO your_db_user;
+GRANT ALL PRIVILEGES ON DATABASE your_database TO your_db_user;
+```
+
+#### Kubernetes Deployment Example
+
+For EKS deployments with IAM roles for service accounts:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rindexer-config
+data:
+  DATABASE_USER: "your-db-user"
+  DATABASE_HOST: "your-db.region.rds.amazonaws.com"
+  DATABASE_NAME: "your-database"
+  DATABASE_PORT: "5432"
+  AWS_REGION: "us-east-1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rindexer
+spec:
+  template:
+    spec:
+      serviceAccountName: rindexer-sa  # With IAM role annotation
+      containers:
+      - name: rindexer
+        image: ghcr.io/joshstevens19/rindexer:latest
+        envFrom:
+        - configMapRef:
+            name: rindexer-config
+```
+
 ### enabled
 
 If postgres is enabled or not, if you do not wish to use postgres you can set this to false or remove postgres from the storage completely.

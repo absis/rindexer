@@ -13,7 +13,7 @@ pub use health::{start_health_server, HealthServer, HealthServerState, HealthSta
 
 mod database;
 pub use database::postgres::{
-    client::{PostgresClient, ToSql},
+    client::{PostgresClient, PostgresTransaction, ToSql},
     generate::drop_tables_for_indexer_sql,
     setup::setup_postgres,
     sql_type_wrapper::EthereumSqlTypeWrapper,
