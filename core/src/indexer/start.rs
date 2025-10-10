@@ -25,7 +25,7 @@ use crate::{
         last_synced::{get_last_synced_block_number, SyncConfig},
         native_transfer::{native_transfer_block_fetch, NATIVE_TRANSFER_CONTRACT_NAME},
         process::{
-            process_contracts_events_with_dependencies, process_event,
+            process_contracts_events_with_dependencies, process_non_blocking_event,
             ProcessContractsEventsWithDependenciesError, ProcessEventError,
         },
         progress::IndexingEventsProgressState,
@@ -155,8 +155,7 @@ async fn get_start_end_block(
     }
 
     let (end_block, indexing_distance_from_head) =
-        calculate_safe_block_number(reorg_safe_distance, &provider, latest_block, end_block)
-            .await?;
+        calculate_safe_block_number(reorg_safe_distance, &provider, latest_block, end_block);
 
     Ok((start_block, end_block, indexing_distance_from_head))
 }
@@ -452,7 +451,6 @@ pub async fn start_indexing_contract_events(
                 project_path: project_path.clone(),
                 indexer_name: event.indexer_name.clone(),
                 contract_name: event.contract.name.clone(),
-                info_log_name: event.info_log_name(),
                 topic_id: event.topic_id,
                 event_name: event.event_name.clone(),
                 network_contract: Arc::new(network_contract.clone()),
@@ -506,7 +504,7 @@ pub async fn start_indexing_contract_events(
                 &dependencies,
             );
         } else {
-            let process_event = tokio::spawn(process_event(event_processing_config, false));
+            let process_event = tokio::spawn(process_non_blocking_event(event_processing_config));
             non_blocking_process_events.push(process_event);
         }
     }
@@ -632,22 +630,21 @@ pub async fn initialize_database(
     }
 }
 
-pub async fn calculate_safe_block_number(
+pub fn calculate_safe_block_number(
     reorg_safe_distance: bool,
     provider: &Arc<JsonRpcCachedProvider>,
     latest_block: U64,
     mut end_block: U64,
-) -> Result<(U64, U64), StartIndexingError> {
+) -> (U64, U64) {
     let mut indexing_distance_from_head = U64::ZERO;
     if reorg_safe_distance {
-        let chain_id =
-            provider.get_chain_id().await.map_err(StartIndexingError::GetChainIdError)?;
-        let reorg_safe_distance = reorg_safe_distance_for_chain(&chain_id);
+        let chain_id = provider.chain.id();
+        let reorg_safe_distance = reorg_safe_distance_for_chain(chain_id);
         let safe_block_number = latest_block - reorg_safe_distance;
         if end_block > safe_block_number {
             end_block = safe_block_number;
         }
         indexing_distance_from_head = reorg_safe_distance;
     }
-    Ok((end_block, indexing_distance_from_head))
+    (end_block, indexing_distance_from_head)
 }

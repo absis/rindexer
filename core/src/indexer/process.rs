@@ -5,13 +5,15 @@ use futures::StreamExt;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio::{
-    sync::{Mutex, MutexGuard},
+    sync::Mutex,
     task::{JoinError, JoinHandle},
     time::Instant,
 };
 use tracing::{debug, error, info};
 
 use crate::helpers::is_relevant_block;
+use crate::indexer::reorg::reorg_safe_distance_for_chain;
+use crate::provider::JsonRpcCachedProvider;
 use crate::{
     event::{
         callback_registry::EventResult, config::EventProcessingConfig, BuildRindexerFilterError,
@@ -40,13 +42,27 @@ pub enum ProcessEventError {
     ProviderCallError(#[from] ProviderError),
 }
 
-pub async fn process_event(
+/// Processes an event that doesn't have dependencies.
+/// First processes historical logs, then starts live indexing if the event is configured for live indexing.
+/// This function returns immediately without waiting for the indexing to complete.
+pub async fn process_non_blocking_event(
     config: EventProcessingConfig,
-    block_until_indexed: bool,
 ) -> Result<(), ProcessEventError> {
-    debug!("{} - Processing events", config.info_log_name());
+    debug!("{} - Processing non blocking event", config.info_log_name());
 
-    process_event_logs(Arc::new(config), false, block_until_indexed).await?;
+    process_event_logs(Arc::new(config), false, false).await?;
+
+    Ok(())
+}
+
+/// Processes historical logs for a blocking event that has dependencies.
+/// This function waits for the indexing to complete before returning.
+pub async fn process_blocking_event_historical_data(
+    config: Arc<EventProcessingConfig>,
+) -> Result<(), Box<ProviderError>> {
+    debug!("{} - Processing blocking event historical data", config.info_log_name());
+
+    process_event_logs(config, true, true).await?;
 
     Ok(())
 }
@@ -167,17 +183,14 @@ async fn process_contract_events_with_dependencies(
     let mut stack = vec![dependencies.tree];
 
     let live_indexing_events =
-        Arc::new(Mutex::new(Vec::<(Arc<EventProcessingConfig>, RindexerEventFilter)>::new()));
+        Arc::new(Mutex::new(HashMap::<String, EventDependenciesIndexingConfig>::new()));
 
     while let Some(current_tree) = stack.pop() {
         let mut tasks = vec![];
 
         for dependency in &current_tree.contract_events {
-            let event_processing_config = Arc::clone(&events_processing_config);
-            let dependency = dependency.clone();
-            let live_indexing_events = Arc::clone(&live_indexing_events);
             // multi network can have many of the same event names so we need to get them all
-            let event_processing_configs = event_processing_config
+            let event_processing_configs = events_processing_config
                 .iter()
                 .filter(|e| {
                     // TODO - this is a hacky way to check if it's a filter event
@@ -192,14 +205,27 @@ async fn process_contract_events_with_dependencies(
                 let task = tokio::spawn({
                     let live_indexing_events = Arc::clone(&live_indexing_events);
                     async move {
-                        // forces live indexing off as it has to handle it a bit differently
-                        process_event_logs(Arc::clone(&event_processing_config), true, true)
-                            .await?;
+                        process_blocking_event_historical_data(Arc::clone(
+                            &event_processing_config,
+                        ))
+                        .await?;
 
                         if event_processing_config.live_indexing() {
+                            let network_contract = event_processing_config.network_contract();
+
+                            let mut live_indexing_events = live_indexing_events.lock().await;
+                            let entry = live_indexing_events
+                                .entry(network_contract.network.clone())
+                                .or_insert_with(|| EventDependenciesIndexingConfig {
+                                    network: network_contract.network.clone(),
+                                    cached_provider: network_contract.cached_provider.clone(),
+                                    events: Vec::new(),
+                                });
+
                             let rindexer_event_filter =
                                 event_processing_config.to_event_filter()?;
-                            live_indexing_events.lock().await.push((
+
+                            entry.events.push((
                                 Arc::clone(&event_processing_config),
                                 rindexer_event_filter,
                             ));
@@ -240,26 +266,45 @@ async fn process_contract_events_with_dependencies(
         return Ok(());
     }
 
-    live_indexing_for_contract_event_dependencies(&live_indexing_events).await;
+    let live_indexing_tasks = live_indexing_events
+        .values()
+        .map(|config| tokio::spawn(live_indexing_for_contract_event_dependencies(config.clone())))
+        .collect::<Vec<_>>();
+
+    futures::future::try_join_all(live_indexing_tasks).await?;
 
     Ok(())
+}
+
+#[derive(Clone)]
+pub struct EventDependenciesIndexingConfig {
+    pub network: String,
+    pub cached_provider: Arc<JsonRpcCachedProvider>,
+    pub events: Vec<(Arc<EventProcessingConfig>, RindexerEventFilter)>,
 }
 
 // TODO - this is a similar to live_indexing_stream but has to be a bit different we should merge
 // code
 #[allow(clippy::type_complexity)]
-async fn live_indexing_for_contract_event_dependencies<'a>(
-    live_indexing_events: &'a MutexGuard<
-        'a,
-        Vec<(Arc<EventProcessingConfig>, RindexerEventFilter)>,
-    >,
+async fn live_indexing_for_contract_event_dependencies(
+    EventDependenciesIndexingConfig { cached_provider, events, network }: EventDependenciesIndexingConfig,
 ) {
+    debug!(
+        "Live indexing events on {} in order: {}",
+        network,
+        events
+            .iter()
+            .map(|(config, _)| format!("{}::{}", config.contract_name(), config.event_name()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let mut ordering_live_indexing_details_map: HashMap<
         B256,
         Arc<Mutex<OrderedLiveIndexingDetails>>,
-    > = HashMap::with_capacity(live_indexing_events.len());
+    > = HashMap::with_capacity(events.len());
 
-    for (config, event_filter) in live_indexing_events.iter() {
+    for (config, event_filter) in events.iter() {
         let mut filter = event_filter.clone();
         let last_seen_block_number = filter.to_block();
         let next_block_number = last_seen_block_number + U64::from(1);
@@ -282,13 +327,36 @@ async fn live_indexing_for_contract_event_dependencies<'a>(
     let callback_permits = Arc::new(Semaphore::new(1));
 
     loop {
-        let iteration_start = Instant::now();
-
         if !is_running() {
             break;
         }
 
-        for (config, _) in live_indexing_events.iter() {
+        let iteration_start = Instant::now();
+
+        // a consistent latest block number across all events in the batch is required to avoid race conditions
+        let latest_block = match cached_provider.get_latest_block().await {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                error!("Empty latest block returned from provider, will try again in 200ms");
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                continue;
+            }
+            Err(error) => {
+                error!(
+                    "Failed to get latest block, will try again in 1 second - error: {}",
+                    error.to_string()
+                );
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                continue;
+            }
+        };
+        let latest_block_number = U64::from(latest_block.header.number);
+
+        for (config, _) in events.iter() {
             let mut ordering_live_indexing_details = ordering_live_indexing_details_map
                 .get(&config.id())
                 .expect("Failed to get ordering_live_indexing_details_map")
@@ -296,255 +364,221 @@ async fn live_indexing_for_contract_event_dependencies<'a>(
                 .await
                 .clone();
 
-            let latest_block = &config.network_contract().cached_provider.get_latest_block().await;
+            if ordering_live_indexing_details.last_seen_block_number == latest_block_number {
+                debug!(
+                    "{} - {} - No new blocks to process...",
+                    &config.info_log_name(),
+                    IndexingEventProgressStatus::Live.log()
+                );
+                if ordering_live_indexing_details.last_no_new_block_log_time.elapsed()
+                    >= log_no_new_block_interval
+                {
+                    info!(
+                        "{} - {} - No new blocks published in the last 5 minutes - latest block number {}",
+                        &config.info_log_name(),
+                        IndexingEventProgressStatus::Live.log(),
+                        latest_block_number
+                    );
+                    ordering_live_indexing_details.last_no_new_block_log_time = Instant::now();
+                    *ordering_live_indexing_details_map
+                        .get(&config.id())
+                        .expect("Failed to get ordering_live_indexing_details_map")
+                        .lock()
+                        .await = ordering_live_indexing_details;
+                }
+                continue;
+            }
+            debug!(
+                "{} - {} - New block seen {} - Last seen block {}",
+                &config.info_log_name(),
+                IndexingEventProgressStatus::Live.log(),
+                latest_block_number,
+                ordering_live_indexing_details.last_seen_block_number
+            );
+            let reorg_safe_distance = &config.indexing_distance_from_head();
+            let safe_block_number = latest_block_number - reorg_safe_distance;
+            let from_block = ordering_live_indexing_details.filter.from_block();
 
-            match latest_block {
-                Ok(latest_block) => {
-                    if let Some(latest_block) = latest_block {
-                        if let Some(latest_block_number) =
-                            Some(U64::from(latest_block.header.number))
-                        {
-                            if ordering_live_indexing_details.last_seen_block_number
-                                == latest_block_number
-                            {
-                                debug!(
-                                    "{} - {} - No new blocks to process...",
+            // check reorg distance and skip if not safe
+            if from_block > safe_block_number {
+                if reorg_safe_distance.is_zero() {
+                    let block_distance = latest_block_number - from_block;
+                    let is_outside_reorg_range =
+                        block_distance > reorg_safe_distance_for_chain(cached_provider.chain.id());
+
+                    // it should never get under normal conditions outside the reorg range,
+                    // therefore, we log an error as means RCP state is not in sync with the blockchain
+                    if is_outside_reorg_range {
+                        error!(
+                            "{} - {} - RPC has gone back on latest block: rpc returned {}, last seen: {}",
+                            &config.info_log_name(),
+                            IndexingEventProgressStatus::Live.log(),
+                            latest_block_number,
+                            from_block
+                        );
+                    } else {
+                        info!(
+                            "{} - {} - RPC has gone back on latest block: rpc returned {}, last seen: {}",
+                            &config.info_log_name(),
+                            IndexingEventProgressStatus::Live.log(),
+                            latest_block_number,
+                            from_block
+                        );
+                    }
+
+                    continue;
+                } else {
+                    info!(
+                        "{} - {} - not in safe reorg block range yet block: {} > range: {}",
+                        &config.info_log_name(),
+                        IndexingEventProgressStatus::Live.log(),
+                        from_block,
+                        safe_block_number
+                    );
+                    continue;
+                }
+            }
+
+            let to_block = safe_block_number;
+            if from_block == to_block
+                && !config.network_contract().disable_logs_bloom_checks
+                && !is_relevant_block(
+                    &ordering_live_indexing_details.filter.contract_addresses().await,
+                    &config.topic_id(),
+                    &latest_block,
+                )
+            {
+                debug!(
+                    "{} - {} - Skipping block {} as it's not relevant",
+                    &config.info_log_name(),
+                    IndexingEventProgressStatus::Live.log(),
+                    from_block
+                );
+                debug!(
+                    "{} - {} - Did not need to hit RPC as no events in {} block - LogsBloom for block checked",
+                    &config.info_log_name(),
+                    IndexingEventProgressStatus::Live.log(),
+                    from_block
+                );
+
+                ordering_live_indexing_details.filter =
+                    ordering_live_indexing_details.filter.set_from_block(to_block + U64::from(1));
+
+                ordering_live_indexing_details.last_seen_block_number = to_block;
+                *ordering_live_indexing_details_map
+                    .get(&config.id())
+                    .expect("Failed to get ordering_live_indexing_details_map")
+                    .lock()
+                    .await = ordering_live_indexing_details;
+                continue;
+            }
+
+            ordering_live_indexing_details.filter =
+                ordering_live_indexing_details.filter.set_to_block(to_block);
+
+            debug!(
+                "{} - {} - Processing live filter: {:?}",
+                &config.info_log_name(),
+                IndexingEventProgressStatus::Live.log(),
+                ordering_live_indexing_details.filter
+            );
+
+            match cached_provider.get_logs(&ordering_live_indexing_details.filter).await {
+                Ok(logs) => {
+                    debug!(
+                        "{} - {} - Live id {} topic_id {}, Logs: {} from {} to {}",
+                        &config.info_log_name(),
+                        IndexingEventProgressStatus::Live.log(),
+                        &config.id(),
+                        &config.topic_id(),
+                        logs.len(),
+                        from_block,
+                        to_block
+                    );
+
+                    debug!(
+                        "{} - {} - Fetched {} event logs - blocks: {} - {}",
+                        &config.info_log_name(),
+                        IndexingEventProgressStatus::Live.log(),
+                        logs.len(),
+                        from_block,
+                        to_block
+                    );
+
+                    let logs_empty = logs.is_empty();
+                    // clone here over the full logs way less overhead
+                    let last_log = logs.last().cloned();
+
+                    let fetched_logs = Ok(FetchLogsResult { logs, from_block, to_block });
+
+                    let result = handle_logs_result(
+                        Arc::clone(config),
+                        callback_permits.clone(),
+                        fetched_logs,
+                    )
+                    .await;
+
+                    match result {
+                        Ok(task) => {
+                            let complete = task.await;
+                            if let Err(e) = complete {
+                                error!(
+                                    "{} - {} - Error indexing task: {} - will try again in 200ms",
                                     &config.info_log_name(),
-                                    IndexingEventProgressStatus::Live.log()
+                                    IndexingEventProgressStatus::Live.log(),
+                                    e
                                 );
-                                if ordering_live_indexing_details
-                                    .last_no_new_block_log_time
-                                    .elapsed()
-                                    >= log_no_new_block_interval
-                                {
-                                    info!(
-                                        "{}::{} - {} - No new blocks published in the last 5 minutes - latest block number {}",
-                                        &config.info_log_name(),
-                                        &config.network_contract().network,
-                                        IndexingEventProgressStatus::Live.log(),
-                                        latest_block_number
-                                    );
-                                    ordering_live_indexing_details.last_no_new_block_log_time =
-                                        Instant::now();
-                                    *ordering_live_indexing_details_map
-                                        .get(&config.id())
-                                        .expect("Failed to get ordering_live_indexing_details_map")
-                                        .lock()
-                                        .await = ordering_live_indexing_details;
-                                }
-                                continue;
+                                break;
                             }
-                            debug!(
-                                "{} - {} - New block seen {} - Last seen block {}",
-                                &config.info_log_name(),
-                                IndexingEventProgressStatus::Live.log(),
-                                latest_block_number,
-                                ordering_live_indexing_details.last_seen_block_number
-                            );
-                            let reorg_safe_distance = &config.indexing_distance_from_head();
-                            let safe_block_number = latest_block_number - reorg_safe_distance;
-                            let from_block = ordering_live_indexing_details.filter.from_block();
-                            // check reorg distance and skip if not safe
-                            if from_block > safe_block_number {
-                                if reorg_safe_distance.is_zero() {
-                                    info!(
-                                    "{}::{} - RPC has gone back on latest block: rpc returned {}, last seen: {}",
-                                    &config.info_log_name(),
-                                    IndexingEventProgressStatus::Live.log(),
-                                    latest_block_number,
-                                    from_block
-                                );
-                                } else {
-                                    info!(
-                                        "{}::{} - {} - not in safe reorg block range yet block: {} > range: {}",
-                                        &config.info_log_name(),
-                                        &config.network_contract().network,
-                                        IndexingEventProgressStatus::Live.log(),
-                                        from_block,
-                                        safe_block_number
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            let to_block = safe_block_number;
-                            if from_block == to_block
-                                && !config.network_contract().disable_logs_bloom_checks
-                                && !is_relevant_block(
-                                    &ordering_live_indexing_details
-                                        .filter
-                                        .contract_addresses()
-                                        .await,
-                                    &config.topic_id(),
-                                    latest_block,
-                                )
-                            {
-                                debug!(
-                                    "{}::{} - {} - Skipping block {} as it's not relevant",
-                                    &config.info_log_name(),
-                                    &config.network_contract().network,
-                                    IndexingEventProgressStatus::Live.log(),
-                                    from_block
-                                );
-                                debug!(
-                                    "{}::{} - {} - Did not need to hit RPC as no events in {} block - LogsBloom for block checked",
-                                    &config.info_log_name(),
-                                    &config.network_contract().network,
-                                    IndexingEventProgressStatus::Live.log(),
-                                    from_block
-                                );
-
+                            ordering_live_indexing_details.last_seen_block_number = to_block;
+                            if logs_empty {
                                 ordering_live_indexing_details.filter =
                                     ordering_live_indexing_details
                                         .filter
                                         .set_from_block(to_block + U64::from(1));
-
-                                ordering_live_indexing_details.last_seen_block_number = to_block;
-                                *ordering_live_indexing_details_map
-                                    .get(&config.id())
-                                    .expect("Failed to get ordering_live_indexing_details_map")
-                                    .lock()
-                                    .await = ordering_live_indexing_details;
-                                continue;
+                                debug!(
+                                    "{} - {} - No events found between blocks {} - {}",
+                                    &config.info_log_name(),
+                                    IndexingEventProgressStatus::Live.log(),
+                                    from_block,
+                                    to_block
+                                );
+                            } else if let Some(last_log) = last_log {
+                                if let Some(last_log_block_number) = last_log.block_number {
+                                    ordering_live_indexing_details.filter =
+                                        ordering_live_indexing_details
+                                            .filter
+                                            .set_from_block(U64::from(last_log_block_number + 1));
+                                } else {
+                                    error!("Failed to get last log block number the provider returned null (should never happen) - try again in 200ms");
+                                }
                             }
 
-                            ordering_live_indexing_details.filter =
-                                ordering_live_indexing_details.filter.set_to_block(to_block);
-
-                            debug!(
-                                "{} - {} - Processing live filter: {:?}",
+                            *ordering_live_indexing_details_map
+                                .get(&config.id())
+                                .expect("Failed to get ordering_live_indexing_details_map")
+                                .lock()
+                                .await = ordering_live_indexing_details;
+                        }
+                        Err(err) => {
+                            error!(
+                                "{} - {} - Error fetching logs: {} - will try again in 200ms",
                                 &config.info_log_name(),
                                 IndexingEventProgressStatus::Live.log(),
-                                ordering_live_indexing_details.filter
+                                err
                             );
-
-                            match config
-                                .network_contract()
-                                .cached_provider
-                                .get_logs(&ordering_live_indexing_details.filter)
-                                .await
-                            {
-                                Ok(logs) => {
-                                    debug!(
-                                        "{}::{} - {} - Live id {} topic_id {}, Logs: {} from {} to {}",
-                                        &config.info_log_name(),
-                                        &config.network_contract().network,
-                                        IndexingEventProgressStatus::Live.log(),
-                                        &config.id(),
-                                        &config.topic_id(),
-                                        logs.len(),
-                                        from_block,
-                                        to_block
-                                    );
-
-                                    debug!(
-                                        "{}::{} - {} - Fetched {} event logs - blocks: {} - {}",
-                                        &config.info_log_name(),
-                                        &config.network_contract().network,
-                                        IndexingEventProgressStatus::Live.log(),
-                                        logs.len(),
-                                        from_block,
-                                        to_block
-                                    );
-
-                                    let logs_empty = logs.is_empty();
-                                    // clone here over the full logs way less overhead
-                                    let last_log = logs.last().cloned();
-
-                                    let fetched_logs =
-                                        Ok(FetchLogsResult { logs, from_block, to_block });
-
-                                    let result = handle_logs_result(
-                                        Arc::clone(config),
-                                        callback_permits.clone(),
-                                        fetched_logs,
-                                    )
-                                    .await;
-
-                                    match result {
-                                        Ok(task) => {
-                                            let complete = task.await;
-                                            if let Err(e) = complete {
-                                                error!(
-                                                        "{}::{} - {} - Error indexing task: {} - will try again in 200ms",
-                                                        &config.info_log_name(),
-                                                        &config.network_contract().network,
-                                                        IndexingEventProgressStatus::Live.log(),
-                                                        e
-                                                    );
-                                                break;
-                                            }
-                                            ordering_live_indexing_details.last_seen_block_number =
-                                                to_block;
-                                            if logs_empty {
-                                                ordering_live_indexing_details.filter =
-                                                    ordering_live_indexing_details
-                                                        .filter
-                                                        .set_from_block(to_block + U64::from(1));
-                                                debug!(
-                                                        "{}::{} - {} - No events found between blocks {} - {}",
-                                                        &config.info_log_name(),
-                                                        &config.network_contract().network,
-                                                        IndexingEventProgressStatus::Live.log(),
-                                                        from_block,
-                                                        to_block
-                                                    );
-                                            } else if let Some(last_log) = last_log {
-                                                if let Some(last_log_block_number) =
-                                                    last_log.block_number
-                                                {
-                                                    ordering_live_indexing_details.filter =
-                                                        ordering_live_indexing_details
-                                                            .filter
-                                                            .set_from_block(U64::from(
-                                                                last_log_block_number + 1,
-                                                            ));
-                                                } else {
-                                                    error!("Failed to get last log block number the provider returned null (should never happen) - try again in 200ms");
-                                                }
-                                            }
-
-                                            *ordering_live_indexing_details_map
-                                                .get(&config.id())
-                                                .expect("Failed to get ordering_live_indexing_details_map")
-                                                .lock()
-                                                .await = ordering_live_indexing_details;
-                                        }
-                                        Err(err) => {
-                                            error!(
-                                                    "{}::{} - {} - Error fetching logs: {} - will try again in 200ms",
-                                                    &config.info_log_name(),
-                                                    &config.network_contract().network,
-                                                    IndexingEventProgressStatus::Live.log(),
-                                                    err
-                                                );
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    error!(
-                                            "{}::{} - {} - Error fetching logs: {} - will try again in 200ms",
-                                            &config.info_log_name(),
-                                            &config.network_contract().network,
-                                            IndexingEventProgressStatus::Live.log(),
-                                            err
-                                        );
-                                    break;
-                                }
-                            }
-                        } else {
-                            info!("WARNING - empty latest block returned from provider, will try again in 200ms");
+                            break;
                         }
-                    } else {
-                        info!("WARNING - empty latest block returned from provider, will try again in 200ms");
                     }
                 }
-                Err(error) => {
+                Err(err) => {
                     error!(
-                        "Failed to get latest block, will try again in 200ms - error: {}",
-                        error.to_string()
+                        "{} - {} - Error fetching logs: {} - will try again in 200ms",
+                        &config.info_log_name(),
+                        IndexingEventProgressStatus::Live.log(),
+                        err
                     );
+                    break;
                 }
             }
         }
@@ -590,7 +624,7 @@ async fn handle_logs_result(
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send>> {
     match result {
         Ok(result) => {
-            debug!("Processing logs {} - length {}", config.event_name(), result.logs.len());
+            debug!("{} - Processing {} logs", config.info_log_name(), result.logs.len());
 
             let fn_data = result
                 .logs

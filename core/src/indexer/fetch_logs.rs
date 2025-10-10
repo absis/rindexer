@@ -1,5 +1,6 @@
 use crate::blockclock::BlockClock;
 use crate::helpers::{halved_block_number, is_relevant_block};
+use crate::indexer::reorg::reorg_safe_distance_for_chain;
 use crate::{
     event::{config::EventProcessingConfig, RindexerEventFilter},
     indexer::{reorg::handle_chain_notification, IndexingEventProgressStatus},
@@ -39,12 +40,7 @@ pub fn fetch_logs_stream(
     // This is per network contract-event, so it should be relatively small.
     let channel_size = config.config().buffer.unwrap_or(4);
 
-    debug!(
-        "{}::{} Configured with {} event buffer",
-        config.info_log_name(),
-        config.network_contract().network,
-        channel_size
-    );
+    debug!("{} Configured with {} event buffer", config.info_log_name(), channel_size);
 
     let (tx, rx) = mpsc::channel(channel_size);
 
@@ -66,9 +62,8 @@ pub fn fetch_logs_stream(
             ));
             if random_ratio(1, 20) {
                 warn!(
-                    "{}::{} - {} - max block range of {} applied - indexing will be slower than providers supplying the optimal ranges - https://rindexer.xyz/docs/references/rpc-node-providers#rpc-node-providers",
+                    "{} - {} - max block range of {} applied - indexing will be slower than providers supplying the optimal ranges - https://rindexer.xyz/docs/references/rpc-node-providers#rpc-node-providers",
                     config.info_log_name(),
-                    config.network_contract().network,
                     IndexingEventProgressStatus::Syncing.log(),
                     max_block_range_limitation.unwrap()
                 );
@@ -90,7 +85,6 @@ pub fn fetch_logs_stream(
                 max_block_range_limitation,
                 snapshot_to_block,
                 &config.info_log_name(),
-                &config.network_contract().network,
             )
             .await;
 
@@ -99,9 +93,8 @@ pub fn fetch_logs_stream(
             if let Some(range) = max_block_range_limitation {
                 if range.to::<u64>() < 5000 && random_ratio(1, 20) {
                     warn!(
-                        "{}::{} - RPC PROVIDER IS SLOW - Slow indexing mode enabled, max block range limitation: {} blocks - we advise using a faster provider who can predict the next block ranges.",
+                        "{} - RPC PROVIDER IS SLOW - Slow indexing mode enabled, max block range limitation: {} blocks - we advise using a faster provider who can predict the next block ranges.",
                         &config.info_log_name(),
-                        &config.network_contract().network,
                         range
                     );
                 }
@@ -124,9 +117,8 @@ pub fn fetch_logs_stream(
         }
 
         info!(
-            "{}::{} - {} - Finished indexing historic events",
+            "{} - {} - Finished indexing historic events",
             &config.info_log_name(),
-            &config.network_contract().network,
             IndexingEventProgressStatus::Completed.log()
         );
 
@@ -143,7 +135,6 @@ pub fn fetch_logs_stream(
                 current_filter,
                 &config.info_log_name(),
                 config.network_contract().disable_logs_bloom_checks,
-                &config.network_contract().network,
                 original_max_limit,
             )
             .await;
@@ -169,15 +160,13 @@ async fn fetch_historic_logs_stream(
     max_block_range_limitation: Option<U64>,
     snapshot_to_block: U64,
     info_log_name: &str,
-    network: &str,
 ) -> Option<ProcessHistoricLogsStreamResult> {
     let from_block = current_filter.from_block();
     let to_block = current_filter.to_block();
 
     debug!(
-        "{}::{} - {} - Process historic events - blocks: {} - {}",
+        "{} - {} - Process historic events - blocks: {} - {}",
         info_log_name,
-        network,
         IndexingEventProgressStatus::Syncing.log(),
         from_block,
         to_block
@@ -209,9 +198,8 @@ async fn fetch_historic_logs_stream(
 
     if tx.capacity() == 0 {
         debug!(
-            "{}::{} - {} - Log channel full, waiting for events to be processed.",
+            "{} - {} - Log channel full, waiting for events to be processed.",
             info_log_name,
-            network,
             IndexingEventProgressStatus::Syncing.log(),
         );
     }
@@ -234,9 +222,8 @@ async fn fetch_historic_logs_stream(
 
             if !logs_empty {
                 info!(
-                    "{}::{} - {} - Fetched {} logs between: {} - {}",
+                    "{} - {} - Fetched {} logs between: {} - {}",
                     info_log_name,
-                    network,
                     IndexingEventProgressStatus::Syncing.log(),
                     logs.len(),
                     from_block,
@@ -271,9 +258,8 @@ async fn fetch_historic_logs_stream(
                     );
 
                     debug!(
-                        "{}::{} - No events between {} - {}. Searching next {} blocks.",
+                        "{} - No events between {} - {}. Searching next {} blocks.",
                         info_log_name,
-                        network,
                         from_block,
                         to_block,
                         new_to_block - next_from_block
@@ -338,7 +324,6 @@ async fn fetch_historic_logs_stream(
             // to get information on what the ideal block range should be.
             if let Some(retry_result) = retry_with_block_range(
                 info_log_name,
-                network,
                 &err,
                 from_block,
                 to_block,
@@ -349,9 +334,8 @@ async fn fetch_historic_logs_stream(
                 // Log if we "overshrink"
                 if retry_result.to - retry_result.from < U64::from(1000) {
                     debug!(
-                        "{}::{} - {} - Over-fetched {} to {}. Shrunk ({}): {} to {}{}",
+                        "{} - {} - Over-fetched {} to {}. Shrunk ({}): {} to {}{}",
                         info_log_name,
-                        network,
                         IndexingEventProgressStatus::Syncing.log(),
                         from_block,
                         to_block,
@@ -377,8 +361,7 @@ async fn fetch_historic_logs_stream(
 
             // Handle deserialization, networking, and other non-rpc related errors.
             error!(
-                "[{}] - {} - {} - Unexpected error fetching logs in range {} - {}. Retry fetching {} - {}: {:?}",
-                network,
+                "{} - {} - Unexpected error fetching logs in range {} - {}. Retry fetching {} - {}: {:?}",
                 info_log_name,
                 IndexingEventProgressStatus::Syncing.log(),
                 from_block,
@@ -412,7 +395,6 @@ async fn live_indexing_stream(
     mut current_filter: RindexerEventFilter,
     info_log_name: &str,
     disable_logs_bloom_checks: bool,
-    network: &str,
     original_max_limit: Option<U64>,
 ) {
     let mut last_seen_block_number = last_seen_block_number;
@@ -426,11 +408,10 @@ async fn live_indexing_stream(
     // Spawn a separate task to handle notifications
     if let Some(notifications) = chain_state_notification {
         let info_log_name = info_log_name.to_string();
-        let network = network.to_string();
         tokio::spawn(async move {
             let mut notifications_clone = notifications.subscribe();
             while let Ok(notification) = notifications_clone.recv().await {
-                handle_chain_notification(notification, &info_log_name, &network);
+                handle_chain_notification(notification, &info_log_name);
             }
         });
     }
@@ -467,9 +448,8 @@ async fn live_indexing_stream(
                         );
                         if last_no_new_block_log_time.elapsed() >= log_no_new_block_interval {
                             info!(
-                                    "{}::{} - {} - No new blocks published in the last 5 minutes - latest block number {}",
+                                    "{} - {} - No new blocks published in the last 5 minutes - latest block number {}",
                                     info_log_name,
-                                    network,
                                     IndexingEventProgressStatus::Live.log(),
                                     last_seen_block_number,
                                 );
@@ -488,16 +468,32 @@ async fn live_indexing_stream(
                         let from_block = current_filter.from_block();
                         if from_block > safe_block_number {
                             if reorg_safe_distance.is_zero() {
-                                info!(
-                                    "{}::{} - RPC has gone back on latest block: rpc returned {}, last seen: {}",
-                                    info_log_name,
-                                    IndexingEventProgressStatus::Live.log(),
-                                    latest_block_number,
-                                    from_block
-                                );
+                                let block_distance = latest_block_number - from_block;
+                                let is_outside_reorg_range = block_distance
+                                    > reorg_safe_distance_for_chain(cached_provider.chain.id());
+
+                                // it should never get under normal conditions outside the reorg range,
+                                // therefore, we log an error as means RCP state is not in sync with the blockchain
+                                if is_outside_reorg_range {
+                                    error!(
+                                        "{} - {} - LIVE INDEXING STEAM - RPC has gone back on latest block: rpc returned {}, last seen: {}",
+                                        info_log_name,
+                                        IndexingEventProgressStatus::Live.log(),
+                                        latest_block_number,
+                                        from_block
+                                    );
+                                } else {
+                                    info!(
+                                        "{} - {} - LIVE INDEXING STEAM - RPC has gone back on latest block: rpc returned {}, last seen: {}",
+                                        info_log_name,
+                                        IndexingEventProgressStatus::Live.log(),
+                                        latest_block_number,
+                                        from_block
+                                    );
+                                }
                             } else {
                                 info!(
-                                    "{} - {} - not in safe reorg block range yet block: {} > range: {}",
+                                    "{} - {} - LIVE INDEXING STEAM - not in safe reorg block range yet block: {} > range: {}",
                                     info_log_name,
                                     IndexingEventProgressStatus::Live.log(),
                                     from_block,
@@ -579,9 +575,8 @@ async fn live_indexing_stream(
 
                                         if tx.capacity() == 0 {
                                             warn!(
-                                                "{}::{} - {} - Log channel full, live indexer will wait for events to be processed.",
+                                                "{} - {} - Log channel full, live indexer will wait for events to be processed.",
                                                 info_log_name,
-                                                network,
                                                 IndexingEventProgressStatus::Live.log(),
                                             );
                                         }
@@ -611,9 +606,8 @@ async fn live_indexing_stream(
                                             .await
                                         {
                                             error!(
-                                                "{}::{} - {} - Failed to send logs to stream consumer! Err: {}",
+                                                "{} - {} - Failed to send logs to stream consumer! Err: {}",
                                                 info_log_name,
-                                                network,
                                                 IndexingEventProgressStatus::Live.log(),
                                                 e
                                             );
@@ -627,13 +621,12 @@ async fn live_indexing_stream(
                                             current_filter = current_filter
                                                 .set_from_block(to_block + U64::from(1));
                                             debug!(
-                                                    "{}::{} - {} - No events found between blocks {} - {}",
-                                                    info_log_name,
-                                                    network,
-                                                    IndexingEventProgressStatus::Live.log(),
-                                                    from_block,
-                                                    to_block,
-                                                );
+                                                "{} - {} - No events found between blocks {} - {}",
+                                                info_log_name,
+                                                IndexingEventProgressStatus::Live.log(),
+                                                from_block,
+                                                to_block,
+                                            );
                                         } else if let Some(last_log) = last_log {
                                             if let Some(last_log_block_number) =
                                                 last_log.block_number
@@ -649,7 +642,6 @@ async fn live_indexing_stream(
                                     Err(err) => {
                                         if let Some(retry_result) = retry_with_block_range(
                                             info_log_name,
-                                            network,
                                             &err,
                                             from_block,
                                             to_block,
@@ -658,9 +650,8 @@ async fn live_indexing_stream(
                                         .await
                                         {
                                             debug!(
-                                                    "{}::{} - {} - Overfetched from {} to {} - shrinking to block range: from {} to {}",
+                                                    "{} - {} - Overfetched from {} to {} - shrinking to block range: from {} to {}",
                                                     info_log_name,
-                                                    network,
                                                     IndexingEventProgressStatus::Live.log(),
                                                     from_block,
                                                     to_block,
@@ -674,9 +665,8 @@ async fn live_indexing_stream(
                                                 halved_block_number(to_block, from_block);
 
                                             error!(
-                                                    "{}::{} - {} - Unexpected error fetching logs in range {} - {}. Retry fetching {} - {}: {:?}",
+                                                    "{} - {} - Unexpected error fetching logs in range {} - {}. Retry fetching {} - {}: {:?}",
                                                     info_log_name,
-                                                    network,
                                                     IndexingEventProgressStatus::Live.log(),
                                                     from_block,
                                                     to_block,
@@ -698,7 +688,7 @@ async fn live_indexing_stream(
             }
             Err(e) => {
                 error!(
-                    "Error getting latest block, will try again in 1 seconds - err: {}",
+                    "Error getting latest block, will try again in 1 second - err: {}",
                     e.to_string()
                 );
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -727,7 +717,6 @@ struct RetryWithBlockRangeResult {
 /// Attempts to retry with a new block range based on the error message.
 async fn retry_with_block_range(
     info_log_name: &str,
-    network: &str,
     error: &ProviderError,
     from_block: U64,
     to_block: U64,
@@ -768,8 +757,8 @@ async fn retry_with_block_range(
                 ) {
                     if from > to {
                         warn!(
-                            "{}::{} Alchemy returned a negative block range {} to {}. Inverting.",
-                            info_log_name, network, from, to
+                            "{} Alchemy returned a negative block range {} to {}. Inverting.",
+                            info_log_name, from, to
                         );
 
                         // Negative range fixed by inverting.
@@ -789,8 +778,8 @@ async fn retry_with_block_range(
                     });
                 } else {
                     info!(
-                        "{}::{} Failed to parse block numbers {} and {}",
-                        info_log_name, network, start_block_str, end_block_str
+                        "{} Failed to parse block numbers {} and {}",
+                        info_log_name, start_block_str, end_block_str
                     );
                 }
             }
@@ -896,8 +885,8 @@ async fn retry_with_block_range(
         let mut next_to_block = from_block + block_range.value();
 
         warn!(
-            "{}::{} Computed a fallback block range {:?}. Provider did not provide information in error: {:?}",
-            info_log_name,network, block_range, error_message
+            "{} Computed a fallback block range {:?}. Provider did not provide information in error: {:?}",
+            info_log_name, block_range, error_message
         );
 
         if next_to_block == to_block {
@@ -906,7 +895,10 @@ async fn retry_with_block_range(
         }
 
         if next_to_block < from_block {
-            error!("{}::{} Computed a negative fallback block range. Overriding to single block fetch.",info_log_name,network);
+            error!(
+                "{} Computed a negative fallback block range. Overriding to single block fetch.",
+                info_log_name
+            );
 
             return Some(RetryWithBlockRangeResult {
                 from: from_block,
